@@ -22,9 +22,14 @@ const exerciseManager = document.getElementById("exercise-manager");
 const newExerciseInput = document.getElementById("new-exercise");
 const addExerciseButton = document.getElementById("add-exercise");
 const exerciseListContainer = document.getElementById("exercise-list");
+const authEmailInput = document.getElementById("auth-email");
+const authPasswordInput = document.getElementById("auth-password");
+const authStatus = document.getElementById("auth-status");
+const loginButton = document.getElementById("login-button");
+const signupButton = document.getElementById("signup-button");
+const logoutButton = document.getElementById("logout-button");
+const appContent = document.getElementById("app-content");
 
-const LOGS_STORAGE_KEY = "workoutTrackerLogs";
-const EXERCISES_STORAGE_KEY = "workoutTrackerExercises";
 const DEFAULT_EXERCISES = [
   "Bench Press",
   "Squat",
@@ -40,83 +45,173 @@ const workoutLogs = [];
 const exerciseLibrary = [];
 let pendingSets = [];
 let feedbackTimer = null;
+let supabase = null;
+let currentUser = null;
 
 function normalizeExerciseName(name) {
-  return name.trim().replace(/\s+/g, " ");
+  return String(name || "").trim().replace(/\s+/g, " ");
 }
 
-function loadExercises() {
-  const raw = localStorage.getItem(EXERCISES_STORAGE_KEY);
-  if (!raw) {
-    exerciseLibrary.push(...DEFAULT_EXERCISES);
+function initializeSupabaseClient() {
+  const config = window.SUPABASE_CONFIG || {};
+  if (!config.url || !config.anonKey || config.url.includes("YOUR_PROJECT_ID")) {
+    authStatus.textContent = "Add your Supabase credentials in supabase-config.js to enable sync.";
+    return false;
+  }
+
+  if (!window.supabase || typeof window.supabase.createClient !== "function") {
+    authStatus.textContent = "Supabase client failed to load.";
+    return false;
+  }
+
+  supabase = window.supabase.createClient(config.url, config.anonKey);
+  return true;
+}
+
+function setAppLockedState(isLocked) {
+  appContent.classList.toggle("pointer-events-none", isLocked);
+  appContent.classList.toggle("opacity-50", isLocked);
+  addSetButton.disabled = isLocked;
+  finishExerciseButton.disabled = isLocked || pendingSets.length === 0;
+}
+
+function setAuthStatus(message, isError = false) {
+  authStatus.textContent = message;
+  authStatus.classList.toggle("text-red-300", isError);
+  authStatus.classList.toggle("text-zinc-400", !isError);
+}
+
+function showFeedback(message, tone = "success") {
+  feedbackMessage.textContent = message;
+  feedbackMessage.classList.remove("text-emerald-400", "text-amber-400");
+  feedbackMessage.classList.add(tone === "success" ? "text-emerald-400" : "text-amber-400");
+  feedbackMessage.classList.add("opacity-100");
+  feedbackMessage.classList.remove("opacity-0");
+
+  if (feedbackTimer) {
+    clearTimeout(feedbackTimer);
+  }
+
+  feedbackTimer = setTimeout(() => {
+    feedbackMessage.classList.remove("opacity-100");
+    feedbackMessage.classList.add("opacity-0");
+  }, 2200);
+}
+
+async function loadExercisesFromDb() {
+  const { data, error } = await supabase
+    .from("exercises")
+    .select("id, name")
+    .order("name", { ascending: true });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  exerciseLibrary.length = 0;
+  data.forEach((item) => {
+    if (item && typeof item.name === "string") {
+      exerciseLibrary.push({ id: item.id, name: normalizeExerciseName(item.name) });
+    }
+  });
+}
+
+async function ensureDefaultExercises() {
+  if (exerciseLibrary.length > 0) {
     return;
   }
 
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      exerciseLibrary.push(...DEFAULT_EXERCISES);
+  const payload = DEFAULT_EXERCISES.map((name) => ({
+    user_id: currentUser.id,
+    name
+  }));
+
+  const { error } = await supabase.from("exercises").insert(payload);
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  await loadExercisesFromDb();
+}
+
+async function loadWorkoutLogsFromDb() {
+  const { data, error } = await supabase
+    .from("workout_sessions")
+    .select("id, exercise_name, performed_at, sets_json")
+    .order("performed_at", { ascending: false });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  workoutLogs.length = 0;
+  data.forEach((row) => {
+    if (!row || !Array.isArray(row.sets_json)) {
       return;
     }
 
-    parsed.forEach((item) => {
-      if (typeof item === "string" && item.trim()) {
-        exerciseLibrary.push(normalizeExerciseName(item));
-      }
-    });
-  } catch (error) {
-    console.error("Failed to load exercise list.", error);
-    exerciseLibrary.push(...DEFAULT_EXERCISES);
-  }
+    const sets = row.sets_json.filter(
+      (set) => set && Number.isFinite(set.weight) && Number.isFinite(set.reps)
+    );
 
-  if (exerciseLibrary.length === 0) {
-    exerciseLibrary.push(...DEFAULT_EXERCISES);
-  }
-}
-
-function saveExercises() {
-  localStorage.setItem(EXERCISES_STORAGE_KEY, JSON.stringify(exerciseLibrary));
-}
-
-function loadLogs() {
-  const raw = localStorage.getItem(LOGS_STORAGE_KEY);
-  if (!raw) {
-    return;
-  }
-
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return;
+    if (sets.length > 0) {
+      workoutLogs.push({
+        id: row.id,
+        exercise: normalizeExerciseName(row.exercise_name),
+        timestamp: row.performed_at,
+        sets
+      });
     }
+  });
+}
 
-    parsed.forEach((entry) => {
-      if (
-        entry &&
-        typeof entry.exercise === "string" &&
-        typeof entry.timestamp === "string" &&
-        Array.isArray(entry.sets)
-      ) {
-        const validSets = entry.sets.filter(
-          (set) => set && Number.isFinite(set.weight) && Number.isFinite(set.reps)
-        );
+async function saveExerciseToDb(name) {
+  const { error } = await supabase.from("exercises").insert({
+    user_id: currentUser.id,
+    name
+  });
 
-        if (validSets.length > 0) {
-          workoutLogs.push({
-            exercise: normalizeExerciseName(entry.exercise),
-            timestamp: entry.timestamp,
-            sets: validSets
-          });
-        }
-      }
-    });
-  } catch (error) {
-    console.error("Failed to load workout history from storage.", error);
+  if (error) {
+    throw new Error(error.message);
   }
 }
 
-function saveLogs() {
-  localStorage.setItem(LOGS_STORAGE_KEY, JSON.stringify(workoutLogs));
+async function deleteExerciseFromDb(id) {
+  const { error } = await supabase.from("exercises").delete().eq("id", id);
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+async function saveWorkoutToDb(exercise, sets) {
+  const payload = {
+    user_id: currentUser.id,
+    exercise_name: exercise,
+    performed_at: new Date().toISOString(),
+    sets_json: sets
+  };
+
+  const { error } = await supabase.from("workout_sessions").insert(payload);
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+async function deleteWorkoutFromDb(id) {
+  const { error } = await supabase.from("workout_sessions").delete().eq("id", id);
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+async function clearHistoryFromDb() {
+  const { error } = await supabase
+    .from("workout_sessions")
+    .delete()
+    .eq("user_id", currentUser.id);
+  if (error) {
+    throw new Error(error.message);
+  }
 }
 
 function formatTime(timestamp) {
@@ -155,36 +250,19 @@ function getDateKey(timestamp) {
   return `${year}-${month}-${day}`;
 }
 
-function showFeedback(message, tone = "success") {
-  feedbackMessage.textContent = message;
-  feedbackMessage.classList.remove("text-emerald-400", "text-amber-400");
-  feedbackMessage.classList.add(tone === "success" ? "text-emerald-400" : "text-amber-400");
-  feedbackMessage.classList.add("opacity-100");
-  feedbackMessage.classList.remove("opacity-0");
-
-  if (feedbackTimer) {
-    clearTimeout(feedbackTimer);
-  }
-
-  feedbackTimer = setTimeout(() => {
-    feedbackMessage.classList.remove("opacity-100");
-    feedbackMessage.classList.add("opacity-0");
-  }, 2200);
-}
-
 function renderExerciseOptions() {
   const previousValue = exerciseSelect.value;
   exerciseSelect.innerHTML = '<option value="">Select exercise</option>';
 
   exerciseLibrary.forEach((exercise) => {
     const option = document.createElement("option");
-    option.value = exercise;
-    option.textContent = exercise;
+    option.value = exercise.name;
+    option.textContent = exercise.name;
     exerciseSelect.appendChild(option);
   });
 
-  const shouldKeepPrevious = exerciseLibrary.includes(previousValue);
-  exerciseSelect.value = shouldKeepPrevious ? previousValue : "";
+  const exists = exerciseLibrary.some((exercise) => exercise.name === previousValue);
+  exerciseSelect.value = exists ? previousValue : "";
 }
 
 function renderExerciseManager() {
@@ -196,29 +274,20 @@ function renderExerciseManager() {
 
     const label = document.createElement("span");
     label.className = "text-xs text-zinc-200";
-    label.textContent = exercise;
+    label.textContent = exercise.name;
 
     const deleteButton = document.createElement("button");
     deleteButton.type = "button";
     deleteButton.className = "rounded px-1 text-xs text-zinc-400 transition hover:text-red-300";
     deleteButton.textContent = "x";
-    deleteButton.addEventListener("click", () => {
-      const index = exerciseLibrary.indexOf(exercise);
-      if (index === -1) {
-        return;
+    deleteButton.addEventListener("click", async () => {
+      try {
+        await deleteExerciseFromDb(exercise.id);
+        await hydrateUserData();
+        showFeedback(`Removed ${exercise.name}`, "success");
+      } catch (error) {
+        showFeedback(error.message, "warning");
       }
-
-      exerciseLibrary.splice(index, 1);
-      if (exerciseLibrary.length === 0) {
-        exerciseLibrary.push(...DEFAULT_EXERCISES);
-      }
-
-      saveExercises();
-      renderExerciseOptions();
-      renderExerciseManager();
-      renderProgressFilter();
-      renderProgressTable();
-      showFeedback(`Removed ${exercise}`, "success");
     });
 
     item.append(label, deleteButton);
@@ -276,49 +345,47 @@ function renderSessionLogs() {
     return;
   }
 
-  workoutLogs
-    .slice()
-    .reverse()
-    .forEach((entry, reverseIndex) => {
-      const sourceIndex = workoutLogs.length - 1 - reverseIndex;
-      const totalVolume = entry.sets.reduce((sum, set) => sum + set.weight * set.reps, 0);
+  workoutLogs.forEach((entry) => {
+    const totalVolume = entry.sets.reduce((sum, set) => sum + set.weight * set.reps, 0);
+    const card = document.createElement("article");
+    card.className = "rounded-xl border border-zinc-700 bg-zinc-900/70 p-3 shadow-sm shadow-black/20";
 
-      const card = document.createElement("article");
-      card.className = "rounded-xl border border-zinc-700 bg-zinc-900/70 p-3 shadow-sm shadow-black/20";
+    const setsMarkup = entry.sets
+      .map((set, setIndex) => `Set ${setIndex + 1}: ${set.weight}kg x ${set.reps}`)
+      .join(" | ");
 
-      const setsMarkup = entry.sets
-        .map((set, setIndex) => `Set ${setIndex + 1}: ${set.weight}kg x ${set.reps}`)
-        .join(" | ");
-
-      card.innerHTML = `
-        <div class="flex items-start justify-between gap-3">
-          <div class="space-y-1">
-            <p class="font-medium text-zinc-100">${entry.exercise}</p>
-            <p class="text-sm text-zinc-300">${setsMarkup}</p>
-            <p class="text-xs text-zinc-500">Volume: ${totalVolume.toFixed(1)} kg</p>
-          </div>
-          <div class="text-right">
-            <p class="text-xs text-zinc-400">${formatDate(entry.timestamp)}</p>
-            <p class="mt-1 text-xs text-zinc-500">${formatTime(entry.timestamp)}</p>
-          </div>
+    card.innerHTML = `
+      <div class="flex items-start justify-between gap-3">
+        <div class="space-y-1">
+          <p class="font-medium text-zinc-100">${entry.exercise}</p>
+          <p class="text-sm text-zinc-300">${setsMarkup}</p>
+          <p class="text-xs text-zinc-500">Volume: ${totalVolume.toFixed(1)} kg</p>
         </div>
-      `;
+        <div class="text-right">
+          <p class="text-xs text-zinc-400">${formatDate(entry.timestamp)}</p>
+          <p class="mt-1 text-xs text-zinc-500">${formatTime(entry.timestamp)}</p>
+        </div>
+      </div>
+    `;
 
-      const deleteButton = document.createElement("button");
-      deleteButton.type = "button";
-      deleteButton.className =
-        "mt-2 rounded-md border border-zinc-700 px-2 py-1 text-xs text-zinc-400 transition hover:border-red-500 hover:text-red-300";
-      deleteButton.textContent = "Delete";
-      deleteButton.addEventListener("click", () => {
-        workoutLogs.splice(sourceIndex, 1);
-        saveLogs();
-        renderAllDataViews();
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className =
+      "mt-2 rounded-md border border-zinc-700 px-2 py-1 text-xs text-zinc-400 transition hover:border-red-500 hover:text-red-300";
+    deleteButton.textContent = "Delete";
+    deleteButton.addEventListener("click", async () => {
+      try {
+        await deleteWorkoutFromDb(entry.id);
+        await hydrateUserData();
         showFeedback("Workout removed", "success");
-      });
-
-      card.appendChild(deleteButton);
-      logsContainer.appendChild(card);
+      } catch (error) {
+        showFeedback(error.message, "warning");
+      }
     });
+
+    card.appendChild(deleteButton);
+    logsContainer.appendChild(card);
+  });
 
   setCount.textContent = `${workoutLogs.length} ${workoutLogs.length === 1 ? "workout" : "workouts"}`;
 }
@@ -410,7 +477,6 @@ function renderProgressTable() {
   }
 
   const fragment = document.createDocumentFragment();
-
   rows.forEach((row) => {
     const tr = document.createElement("tr");
     tr.className = "transition-colors hover:bg-zinc-800/40";
@@ -430,6 +496,8 @@ function renderProgressTable() {
 }
 
 function renderAllDataViews() {
+  renderExerciseOptions();
+  renderExerciseManager();
   renderSessionLogs();
   renderProgressFilter();
   renderProgressTable();
@@ -447,6 +515,78 @@ function setActiveView(view) {
   viewProgressButton.classList.toggle("bg-sky-600", !showSession);
   viewProgressButton.classList.toggle("text-white", !showSession);
   viewProgressButton.classList.toggle("text-zinc-300", showSession);
+}
+
+async function hydrateUserData() {
+  await loadExercisesFromDb();
+  await ensureDefaultExercises();
+  await loadWorkoutLogsFromDb();
+  renderAllDataViews();
+}
+
+async function handleAuthState(session) {
+  currentUser = session?.user || null;
+  const isLoggedIn = Boolean(currentUser);
+
+  logoutButton.classList.toggle("hidden", !isLoggedIn);
+  setAppLockedState(!isLoggedIn);
+
+  if (!isLoggedIn) {
+    exerciseLibrary.length = 0;
+    workoutLogs.length = 0;
+    pendingSets = [];
+    renderPendingSets();
+    renderAllDataViews();
+    setAuthStatus("Sign in to sync your workouts across devices.");
+    return;
+  }
+
+  setAuthStatus(`Signed in as ${currentUser.email}`);
+  await hydrateUserData();
+}
+
+async function signIn() {
+  const email = authEmailInput.value.trim();
+  const password = authPasswordInput.value;
+  if (!email || !password) {
+    setAuthStatus("Email and password are required.", true);
+    return;
+  }
+
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) {
+    setAuthStatus(error.message, true);
+    return;
+  }
+
+  setAuthStatus("Signed in successfully.");
+}
+
+async function signUp() {
+  const email = authEmailInput.value.trim();
+  const password = authPasswordInput.value;
+  if (!email || !password) {
+    setAuthStatus("Email and password are required.", true);
+    return;
+  }
+
+  const { error } = await supabase.auth.signUp({ email, password });
+  if (error) {
+    setAuthStatus(error.message, true);
+    return;
+  }
+
+  setAuthStatus("Sign-up complete. Check your email if confirmation is enabled.");
+}
+
+async function signOut() {
+  const { error } = await supabase.auth.signOut();
+  if (error) {
+    setAuthStatus(error.message, true);
+    return;
+  }
+
+  setAuthStatus("Signed out.");
 }
 
 function handleAddSet() {
@@ -472,106 +612,105 @@ function handleAddSet() {
   weightInput.focus();
 }
 
-function handleFinishExercise(event) {
+async function handleFinishExercise(event) {
   event.preventDefault();
   const exercise = normalizeExerciseName(exerciseSelect.value);
-
   if (!exercise) {
     showFeedback("Choose an exercise", "warning");
     return;
   }
-
   if (pendingSets.length === 0) {
     showFeedback("Add at least one set before saving", "warning");
     return;
   }
 
-  workoutLogs.push({
-    exercise,
-    timestamp: new Date().toISOString(),
-    sets: pendingSets.map((set) => ({ ...set }))
-  });
-
-  pendingSets = [];
-  saveLogs();
-  renderPendingSets();
-  renderAllDataViews();
-  form.reset();
-  exerciseSelect.value = exercise;
-  showFeedback("Workout saved successfully", "success");
+  try {
+    await saveWorkoutToDb(exercise, pendingSets.map((set) => ({ ...set })));
+    pendingSets = [];
+    renderPendingSets();
+    await hydrateUserData();
+    form.reset();
+    exerciseSelect.value = exercise;
+    showFeedback("Workout saved successfully", "success");
+  } catch (error) {
+    showFeedback(error.message, "warning");
+  }
 }
 
-function handleAddExercise() {
+async function handleAddExercise() {
   const normalized = normalizeExerciseName(newExerciseInput.value);
   if (!normalized) {
     return;
   }
 
   const exists = exerciseLibrary.some(
-    (exercise) => exercise.toLowerCase() === normalized.toLowerCase()
+    (exercise) => exercise.name.toLowerCase() === normalized.toLowerCase()
   );
-
   if (exists) {
     showFeedback("Exercise already exists", "warning");
     return;
   }
 
-  exerciseLibrary.push(normalized);
-  exerciseLibrary.sort((a, b) => a.localeCompare(b));
-  saveExercises();
-  renderExerciseOptions();
-  renderExerciseManager();
-  newExerciseInput.value = "";
-  showFeedback(`Added ${normalized}`, "success");
+  try {
+    await saveExerciseToDb(normalized);
+    newExerciseInput.value = "";
+    await hydrateUserData();
+    showFeedback(`Added ${normalized}`, "success");
+  } catch (error) {
+    showFeedback(error.message, "warning");
+  }
 }
 
-function initialize() {
-  loadExercises();
-  loadLogs();
-  renderExerciseOptions();
-  renderExerciseManager();
+async function initialize() {
   renderPendingSets();
   renderAllDataViews();
   setActiveView("session");
+  setAppLockedState(true);
+
+  if (!initializeSupabaseClient()) {
+    return;
+  }
+
+  const { data, error } = await supabase.auth.getSession();
+  if (error) {
+    setAuthStatus(error.message, true);
+    return;
+  }
+
+  await handleAuthState(data.session);
+  supabase.auth.onAuthStateChange(async (_event, session) => {
+    await handleAuthState(session);
+  });
 }
 
 addSetButton.addEventListener("click", handleAddSet);
 form.addEventListener("submit", handleFinishExercise);
-
-clearHistoryButton.addEventListener("click", () => {
-  if (workoutLogs.length === 0) {
+clearHistoryButton.addEventListener("click", async () => {
+  if (!workoutLogs.length) {
     return;
   }
 
-  workoutLogs.length = 0;
-  saveLogs();
-  renderAllDataViews();
-  showFeedback("History cleared", "success");
+  try {
+    await clearHistoryFromDb();
+    await hydrateUserData();
+    showFeedback("History cleared", "success");
+  } catch (error) {
+    showFeedback(error.message, "warning");
+  }
 });
-
-viewSessionButton.addEventListener("click", () => {
-  setActiveView("session");
-});
-
-viewProgressButton.addEventListener("click", () => {
-  setActiveView("progress");
-});
-
-progressFilter.addEventListener("change", () => {
-  renderProgressTable();
-});
-
-toggleExerciseManager.addEventListener("click", () => {
-  exerciseManager.classList.toggle("hidden");
-});
-
+viewSessionButton.addEventListener("click", () => setActiveView("session"));
+viewProgressButton.addEventListener("click", () => setActiveView("progress"));
+progressFilter.addEventListener("change", () => renderProgressTable());
+toggleExerciseManager.addEventListener("click", () => exerciseManager.classList.toggle("hidden"));
 addExerciseButton.addEventListener("click", handleAddExercise);
-
 newExerciseInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     handleAddExercise();
   }
 });
+loginButton.addEventListener("click", signIn);
+signupButton.addEventListener("click", signUp);
+logoutButton.addEventListener("click", signOut);
 
 initialize();
